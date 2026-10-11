@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"unicode"
 )
@@ -49,5 +50,21 @@ func TestAppendQuote(t *testing.T) {
 	}
 	if got, want := in2, in.String(); got != want {
 		t.Fatal("AppendQuote modified string") // no point printing got/want: huge
+	}
+}
+
+// TestJQueryOptionWrapIsGated ensures the served jquery.js does not
+// unconditionally wrap HTML containing <option> elements in a
+// <select multiple> container before parsing it (CVE-2020-11023).
+func TestJQueryOptionWrapIsGated(t *testing.T) {
+	js, ok := Files["jquery.js"]
+	if !ok {
+		t.Fatal("jquery.js missing from Files")
+	}
+	if strings.Contains(js, `option:[1,"<select multiple='multiple'>","</select>"]`) {
+		t.Error("jquery.js unconditionally wraps <option> HTML in <select multiple> (CVE-2020-11023)")
+	}
+	if !strings.Contains(js, `support.option||(`) {
+		t.Error("jquery.js does not gate the <option> wrapMap entry on support.option (CVE-2020-11023)")
 	}
 }
