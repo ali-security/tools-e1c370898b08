@@ -6,6 +6,7 @@ package packages_test
 
 import (
 	"bytes"
+	"go/build"
 	"io/ioutil"
 	"path/filepath"
 	"runtime"
@@ -82,6 +83,9 @@ func TestCgoOption(t *testing.T) {
 	// if !build.Default.CgoEnabled {
 	// 	return
 	// }
+	if !build.Default.CgoEnabled {
+		t.Skip("no cgo: the !DisableCgo case needs cgo-built net and os/user")
+	}
 
 	// Test that we can load cgo-using packages with
 	// DisableCgo=true/false, which, among other things, causes go

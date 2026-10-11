@@ -1,0 +1,199 @@
+# Seal build for golang.org/x/tools v0.0.0-20200512131952-2bc93b1c0c88.
+# Upstream has no GitHub Actions CI (it is tested on the Go build farm), so
+# this workflow was authored from scratch: one job produces the module zip with
+# golang.org/x/mod/zip.CreateFromDir, the test matrix runs the full suite on
+# Linux, Windows and macOS with Go 1.13 (the toolchain of the release era).
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test package/selector arguments; empty runs ./..."
+        required: false
+        default: ""
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODULE_PATH: golang.org/x/tools
+      MODULE_VERSION: v0.0.0-20200512131952-2bc93b1c0c88
+      EXPECTED_ENTRIES: "1471"
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Copy module tree (without .git and the seal workflow)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src"
+          tar --exclude=./.git --exclude=./.github -cf - . | tar -xf - -C "$RUNNER_TEMP/src"
+
+      - name: Prepare create_mod helper module
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/helper"
+          cp .github/create_mod.go "$RUNNER_TEMP/helper/create_mod.go"
+          cd "$RUNNER_TEMP/helper"
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+
+      - name: Create module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cd "$RUNNER_TEMP/helper"
+          go run create_mod.go "$MODULE_PATH" "$MODULE_VERSION" "$RUNNER_TEMP/src" "$GITHUB_WORKSPACE/dist/$MODULE_VERSION.zip"
+
+      - name: Check module zip entry count
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -l "dist/$MODULE_VERSION.zip" | tail -1
+          count=$(unzip -Z1 "dist/$MODULE_VERSION.zip" | wc -l | tr -d ' ')
+          echo "module zip entries: $count (expected $EXPECTED_ENTRIES)"
+          if [ "$count" != "$EXPECTED_ENTRIES" ]; then
+            echo "::error::module zip has $count entries, public zip has $EXPECTED_ENTRIES"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v0.0.0-20200512131952-2bc93b1c0c88.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: "1.13.15"
+            arch: x64
+          - os: windows-latest
+            go: "1.13.15"
+            arch: x64
+          # macos-14: macOS 15 aborts pre-LC_UUID binaries produced by Go 1.13.
+          # x64 under Rosetta: Go 1.13 has no darwin/arm64 port.
+          - os: macos-14
+            go: "1.13.15"
+            arch: x64
+    env:
+      GO111MODULE: "on"
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          architecture: ${{ matrix.arch }}
+          cache: false
+
+      # Go 1.13's cgo cannot parse the DWARF emitted by modern Xcode clang.
+      - name: Disable cgo (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "CGO_ENABLED=0" >> "$GITHUB_ENV"
+
+      # internal/testenv requires GNU diff ("diff -version" must say GNU diffutils)
+      # for internal/lsp/diff/difftest and refactor/rename TestDiff; macOS ships BSD diff.
+      - name: Install GNU diffutils (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install diffutils
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      # Pick the source dir the build and tests run from. Windows: internal/span
+      # TestURIFromPath expects rooted paths like \path\to\dir to resolve to drive C:,
+      # but the runner checks out on D:, so run from a copy on C:.
+      - name: Select source dir
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp -r "$GITHUB_WORKSPACE" /c/xtools
+            echo 'SRC_DIR=C:\xtools' >> "$GITHUB_ENV"
+          else
+            echo "SRC_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          fi
+
+      # Long TEMP path: the default 8.3 short form (RUNNER~1) breaks path comparisons in tests.
+      - name: Set TEMP/TMP (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      # Go 1.13's prebuilt runtime/cgo links against msvcrt (__iob_func); the
+      # runner's C:\mingw64 gcc is UCRT-based, so install an msvcrt MINGW64 gcc.
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        id: msys2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MINGW64 gcc first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin" >> "$GITHUB_PATH"
+
+      - name: Go version
+        shell: bash
+        run: |
+          go version
+          go env
+          if [ "$RUNNER_OS" = "Windows" ]; then which gcc && gcc --version; fi
+
+      - name: Build
+        shell: bash
+        working-directory: ${{ env.SRC_DIR }}
+        run: go build ./...
+
+      # -p 1: cmd/godoc TestWebIndex waits only ~2m for the search index, which
+      # it misses when other test binaries run in parallel.
+      - name: Test
+        shell: bash
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -o pipefail
+          go test -v -p 1 -timeout 30m ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          # Byte-wise matching: the log carries invalid UTF-8 test data that BSD awk rejects.
+          export LC_ALL=C
+          log="$RUNNER_TEMP/go-test.log"
+          if [ ! -f "$log" ]; then
+            echo "TEST SUMMARY: no test log (tests did not run)"
+            exit 1
+          fi
+          passed=$(awk '/^[[:space:]]*--- PASS/{n++} END{print n+0}' "$log")
+          failed=$(awk '/^[[:space:]]*--- FAIL/{n++} END{print n+0}' "$log")
+          skipped=$(awk '/^[[:space:]]*--- SKIP/{n++} END{print n+0}' "$log")
+          pkg_ok=$(awk '/^ok[[:space:]]/{n++} END{print n+0}' "$log")
+          pkg_failed=$(awk '/^FAIL[[:space:]]/{n++} END{print n+0}' "$log")
+          echo "TEST SUMMARY: passed=$passed failed=$failed skipped=$skipped packages_ok=$pkg_ok packages_failed=$pkg_failed"
+          if [ "$failed" -gt 0 ] || [ "$pkg_failed" -gt 0 ]; then
+            awk '/^[[:space:]]*--- FAIL|^FAIL[[:space:]]/' "$log"
+            exit 1
+          fi
